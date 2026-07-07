@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
@@ -36,6 +37,15 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", "8080"))
 # Render sets RENDER_EXTERNAL_URL automatically; WEBHOOK_URL lets you override elsewhere.
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+
+# If set, the bot talks to a local Bot API server instead of Telegram's cloud API.
+# This removes the 20MB file-download limit (raises it to 2000MB) — needed for
+# teams working with long/large videos. Get a free api_id/api_hash from
+# https://my.telegram.org/apps (one-time, uses your own phone number to register
+# an "app", not tied to the bot itself) and set them as TG_API_ID / TG_API_HASH.
+USE_LOCAL_API = bool(os.environ.get("TG_API_ID") and os.environ.get("TG_API_HASH"))
+LOCAL_API_BASE = "http://localhost:8081/bot"
+LOCAL_API_FILE_BASE = "http://localhost:8081/file/bot"
 
 WORKDIR = Path(tempfile.gettempdir()) / "uchiro_sessions"
 WORKDIR.mkdir(exist_ok=True)
@@ -173,9 +183,14 @@ def render_clip(video_path, clip, preset, out_path, music_path=None, text=None):
 # ---------------------------------------------------------------- bot handlers
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    limit_note = (
+        "Large videos are supported (up to 2000MB)." if USE_LOCAL_API
+        else "Videos over 20MB will fail — ask your admin to enable the local Bot API server for bigger files."
+    )
     await update.message.reply_text(
         "Send me a video (your own footage) and I'll auto-cut it into highlight clips, "
         "tag them, and export ready for TikTok/YouTube/Square — no watermark.\n\n"
+        f"{limit_note}\n\n"
         "Optional: send a music file *before* the video and I'll mix it in.\n\n"
         "This bot only edits videos you upload — it can't fetch or download other "
         "people's TikTok/YouTube videos.",
@@ -207,7 +222,22 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("Downloading and checking your video…")
-    file = await tg_file.get_file()
+    try:
+        file = await tg_file.get_file()
+    except BadRequest as e:
+        if "too big" in str(e).lower():
+            if USE_LOCAL_API:
+                await update.message.reply_text(
+                    "This file is too big even for the local API server's limits. Try a shorter clip."
+                )
+            else:
+                await update.message.reply_text(
+                    "This video is over Telegram's 20MB limit for bots. Ask whoever runs this bot to set up "
+                    "the local Bot API server (see README) to raise it to 2000MB, or send a shorter/smaller clip."
+                )
+        else:
+            await update.message.reply_text(f"Couldn't fetch that file: {e}")
+        return
     session_dir = WORKDIR / str(chat_id)
     session_dir.mkdir(exist_ok=True)
     video_path = session_dir / "input.mp4"
@@ -302,7 +332,13 @@ async def process_and_send(chat_id, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if USE_LOCAL_API:
+        log.info("Using local Bot API server — file size limit raised to 2000MB.")
+        builder = builder.base_url(LOCAL_API_BASE).base_file_url(LOCAL_API_FILE_BASE).local_mode(True)
+    else:
+        log.info("Using Telegram's cloud Bot API — file downloads are capped at 20MB.")
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
